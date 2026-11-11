@@ -274,7 +274,7 @@ def test_sort_buffered_cleanup():
     eq_(5, nrows(result))
     eq_(3, len(result._filecache))
     debug('check all files exist')
-    filenames = _get_names(result._filecache)
+    filenames = _get_names(result._filecache.runs)
     for fn in filenames:
         assert os.path.exists(fn), fn
     debug('delete object and garbage collect')
@@ -300,7 +300,7 @@ def test_sort_buffered_cleanup_open_iterator():
     eq_(5, nrows(result))
     eq_(3, len(result._filecache))
     debug('check all files exist')
-    filenames = _get_names(result._filecache)
+    filenames = _get_names(result._filecache.runs)
     for fn in filenames:
         assert os.path.exists(fn), fn
     debug(filenames)
@@ -766,7 +766,7 @@ def test_mergesort_buffered_cleanup(tmp_path):
     # 5 data rows in table1 and 4 in table2, in chunks of at most 2 rows
     for sortview, nchunks in zip(result.sortviews, (3, 2)):
         eq_(nchunks, len(sortview._filecache))
-        filenames.extend(_get_names(sortview._filecache))
+        filenames.extend(_get_names(sortview._filecache.runs))
     for fn in filenames:
         assert os.path.exists(fn), fn
     debug('cached results are repeatable')

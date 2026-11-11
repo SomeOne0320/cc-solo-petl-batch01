@@ -4,6 +4,24 @@ Changes
 Unreleased
 ----------
 
+* Enhancement: :func:`petl.transform.sorts.sort`,
+  :class:`petl.transform.sorts.SortView`,
+  :class:`petl.transform.sorts.MergeSortView` and
+  :func:`petl.transform.sorts.mergesort` now accept a ``merge_fan_in``
+  keyword argument. When an external sort produces more than
+  ``merge_fan_in`` initial run files, they are combined through repeated
+  bounded fan-in merge passes instead of being opened all at once, so the
+  number of open temporary file descriptors stays bounded regardless of
+  input size. A single merge step opens at most ``merge_fan_in`` input run
+  files plus one output run file, a cached view reader opens at most
+  ``merge_fan_in`` run files, and intermediate run files are reclaimed as
+  soon as the merge pass consuming them completes. The default is taken
+  from the new ``petl.config.sort_merge_fan_in`` setting (32). Upper-level
+  transforms that sort internally (e.g. ``join``, ``aggregate``,
+  ``distinct``) benefit from the bound automatically. Values must be an
+  ``int`` (not ``bool``) no smaller than 2; invalid values are rejected
+  before any temporary file is created.
+
 * Fix: :func:`petl.transform.sorts.mergesort` raised ``TypeError`` under
   Python 3 when merging tables with mixed value types and no explicit
   ``key``. Comparisons now use the same rules as
