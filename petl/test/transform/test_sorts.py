@@ -504,6 +504,449 @@ def test_mergesort_empty():
     ieq(expect, actual)
 
 
+def test_mergesort_mixed_types_lexical():
+    # no key, mixed int/str values must be compared using the same
+    # Comparable rules as sort(), not raise TypeError
+    table1 = [['k', 'v'], [1, 'a']]
+    table2 = [['k', 'v'], ['2', 'b']]
+
+    expectation = [('k', 'v'), (1, 'a'), ('2', 'b')]
+    actual = mergesort(table1, table2)
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+
+    expectation_reverse = [('k', 'v'), ('2', 'b'), (1, 'a')]
+    actual = mergesort(table1, table2, reverse=True)
+    ieq(expectation_reverse, actual)
+    ieq(expectation_reverse, actual)
+
+    # same result when inputs are presorted
+    actual = mergesort(sort(table1), sort(table2), presorted=True)
+    ieq(expectation, actual)
+    actual = mergesort(sort(table1, reverse=True),
+                       sort(table2, reverse=True),
+                       presorted=True, reverse=True)
+    ieq(expectation_reverse, actual)
+
+
+def test_mergesort_mixed_types_values():
+    # None, numbers, dates, bytes and text are ordered following the same
+    # rules as sort(), with or without an explicit key
+    dt = datetime
+    table1 = [['v'], [None], [10], ['apple'], [b'x'], [dt(2020, 1, 2)]]
+    table2 = [['v'], [5], [b'bytes'], ['banana'], [dt(2019, 12, 31)]]
+
+    expectation = [('v',),
+                   (None,),
+                   (5,),
+                   (10,),
+                   (dt(2019, 12, 31),),
+                   (dt(2020, 1, 2),),
+                   (b'bytes',),
+                   (b'x',),
+                   ('apple',),
+                   ('banana',)]
+    actual = mergesort(table1, table2)
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+    ieq(sort(cat(table1, table2)), actual)
+
+    actual = mergesort(table1, table2, reverse=True)
+    ieq(sort(cat(table1, table2), reverse=True), actual)
+
+    # explicit key on a heterogeneous column
+    table3 = [['k', 'v'], [1, 'a'], [None, 'b'], ['x', 'c']]
+    table4 = [['k', 'v'], [2, 'd'], ['a', 'e']]
+    expect = sort(cat(table3, table4), key='k')
+    actual = mergesort(table3, table4, key='k')
+    ieq(expect, actual)
+    ieq(expect, actual)
+    actual = mergesort(table3, table4, key='k', reverse=True)
+    ieq(sort(cat(table3, table4), key='k', reverse=True), actual)
+
+
+def test_mergesort_field_order():
+    # tables with different field orders must be sorted according to the
+    # output field order, not their own field order
+    table1 = [['a', 'b'], [100, 100]]
+    table2 = [['b', 'a'], [1, 9], [2, 3]]
+
+    expectation = [('a', 'b'), (3, 2), (9, 1), (100, 100)]
+    actual = mergesort(table1, table2)
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+
+    expectation_reverse = [('a', 'b'), (100, 100), (9, 1), (3, 2)]
+    actual = mergesort(table1, table2, reverse=True)
+    ieq(expectation_reverse, actual)
+    ieq(expectation_reverse, actual)
+
+    # same with an explicit key
+    table1 = [['a', 'b'], [1, 100], [4, 4]]
+    table2 = [['b', 'a'], [50, 2], [3, 3]]
+    expectation = [('a', 'b'), (1, 100), (2, 50), (3, 3), (4, 4)]
+    actual = mergesort(table1, table2, key='a')
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+    ieq(sort(cat(table1, table2), key='a'), actual)
+
+    # key given as field index refers to the output fields
+    actual = mergesort(table1, table2, key=0)
+    ieq(expectation, actual)
+
+
+def test_mergesort_header_short_rows():
+    # explicit header selects output fields; excluded fields do not take
+    # part in comparisons; short rows are filled with missing
+    table1 = [['unused', 'k'], [1]]
+    table2 = [['unused', 'k'], [2, 3]]
+
+    expectation = [('k',), (None,), (3,)]
+    actual = mergesort(table1, table2, header=['k'], key='k')
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+
+    # custom missing value (numbers sort before text)
+    expectation = [('k',), (3,), ('NA',)]
+    actual = mergesort(table1, table2, header=['k'], key='k', missing='NA')
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+
+    # long rows are trimmed to the output fields
+    table1 = [['a'], [1, 2, 3]]
+    table2 = [['a', 'b'], [0, 0]]
+    expectation = [('a', 'b'), (0, 0), (1, None)]
+    actual = mergesort(table1, table2)
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+    ieq(sort(cat(table1, table2)), actual)
+
+
+def test_mergesort_compound_key():
+
+    table1 = [['a', 'b', 'v'], [1, 2, 'x'], [1, 1, 'y']]
+    table2 = [['b', 'a', 'v'], [2, 1, 'p'], [0, 1, 'q']]
+
+    expectation = (('a', 'b', 'v'),
+                   (1, 0, 'q'),
+                   (1, 1, 'y'),
+                   (1, 2, 'x'),
+                   (1, 2, 'p'))
+
+    # can use either field names or indices to specify the sort key
+    actual = mergesort(table1, table2, key=['a', 'b'])
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+    actual = mergesort(table1, table2, key=('a', 'b'))
+    ieq(expectation, actual)
+    actual = mergesort(table1, table2, key=[0, 1])
+    ieq(expectation, actual)
+    actual = mergesort(table1, table2, key=('a', 1))
+    ieq(expectation, actual)
+
+    # reverse
+    actual = mergesort(table1, table2, key=['a', 'b'], reverse=True)
+    ieq(sort(cat(table1, table2), key=['a', 'b'], reverse=True), actual)
+
+
+def test_mergesort_stable():
+    # rows with equal keys keep their original order within each input
+    # table, and ties between tables are broken by table order
+    table1 = [['k', 'v'], [1, 'a1'], [2, 'b1'], [1, 'c1']]
+    table2 = [['k', 'v'], [1, 'a2'], [3, 'd2']]
+    table3 = [['k', 'v'], [2, 'b3'], [1, 'a3']]
+
+    expectation = (('k', 'v'),
+                   (1, 'a1'),
+                   (1, 'c1'),
+                   (1, 'a2'),
+                   (1, 'a3'),
+                   (2, 'b1'),
+                   (2, 'b3'),
+                   (3, 'd2'))
+    actual = mergesort(table1, table2, table3, key='k')
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+    ieq(sort(cat(table1, table2, table3), key='k'), actual)
+
+    expectation_reverse = (('k', 'v'),
+                           (3, 'd2'),
+                           (2, 'b1'),
+                           (2, 'b3'),
+                           (1, 'a1'),
+                           (1, 'c1'),
+                           (1, 'a2'),
+                           (1, 'a3'))
+    actual = mergesort(table1, table2, table3, key='k', reverse=True)
+    ieq(expectation_reverse, actual)
+    ieq(expectation_reverse, actual)
+
+    # presorted inputs are merged stably too
+    actual = mergesort(sort(table1, key='k'), sort(table2, key='k'),
+                       sort(table3, key='k'), key='k', presorted=True)
+    ieq(expectation, actual)
+
+
+def test_mergesort_buffered():
+
+    table1 = (('foo', 'bar'),
+              ('A', 9),
+              ('C', 2),
+              ('D', 10),
+              ('A', 6),
+              ('F', 1))
+    table2 = (('foo', 'baz'),
+              ('B', 3),
+              ('D', 10),
+              ('A', 10),
+              ('F', 4))
+
+    # force the sort of each input table to spill to disk
+    for buffersize in (1, 2, 3):
+        expect = sort(cat(table1, table2), key='foo')
+        actual = mergesort(table1, table2, key='foo', buffersize=buffersize)
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+        expect = sort(cat(table1, table2), key='foo', reverse=True)
+        actual = mergesort(table1, table2, key='foo', reverse=True,
+                           buffersize=buffersize)
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+        # default lexical sort
+        expect = sort(cat(table1, table2))
+        actual = mergesort(table1, table2, buffersize=buffersize)
+        ieq(expect, actual)
+        ieq(expect, actual)
+
+
+def test_mergesort_buffered_tempdir(tmp_path):
+
+    table1 = (('foo', 'bar'),
+              ('A', 9),
+              ('C', 2),
+              ('D', 10),
+              ('A', 6),
+              ('F', 1))
+    table2 = (('foo', 'baz'),
+              ('B', 3),
+              ('D', 10),
+              ('A', 10),
+              ('F', 4))
+
+    tempdir = str(tmp_path)
+    expect = sort(cat(table1, table2), key='foo')
+    actual = mergesort(table1, table2, key='foo', buffersize=2,
+                       tempdir=tempdir)
+    ieq(expect, actual)
+    ieq(expect, actual)
+
+
+def test_mergesort_buffered_cleanup(tmp_path):
+
+    table1 = (('foo', 'bar'),
+              ('A', 9),
+              ('C', 2),
+              ('D', 10),
+              ('A', 6),
+              ('F', 1))
+    table2 = (('foo', 'baz'),
+              ('B', 3),
+              ('D', 10),
+              ('A', 10),
+              ('F', 4))
+
+    result = mergesort(table1, table2, key='foo', buffersize=2,
+                       tempdir=str(tmp_path))
+    debug('pull rows through, should populate file caches')
+    eq_(9, nrows(result))
+    debug('check each input table was sorted in chunks on disk')
+    filenames = list()
+    # 5 data rows in table1 and 4 in table2, in chunks of at most 2 rows
+    for sortview, nchunks in zip(result.sortviews, (3, 2)):
+        eq_(nchunks, len(sortview._filecache))
+        filenames.extend(_get_names(sortview._filecache))
+    for fn in filenames:
+        assert os.path.exists(fn), fn
+    debug('cached results are repeatable')
+    eq_(9, nrows(result))
+    debug('delete object and garbage collect')
+    del sortview
+    del result
+    gc.collect()
+    debug('check all files have been deleted')
+    for fn in filenames:
+        assert not os.path.exists(fn), fn
+
+
+@pytest.mark.skipif(platform.python_implementation() == 'PyPy', reason='SKIP sort cleanup test (PyPy)')
+def test_mergesort_buffered_cleanup_closed_iterator(tmp_path):
+
+    table1 = (('foo', 'bar'),
+              ('A', 9),
+              ('C', 2),
+              ('D', 10),
+              ('A', 6),
+              ('F', 1))
+    table2 = (('foo', 'baz'),
+              ('B', 3),
+              ('D', 10),
+              ('A', 10),
+              ('F', 4))
+
+    # closing an iterator early must not leave temporary files behind
+    result = mergesort(table1, table2, key='foo', buffersize=2,
+                       tempdir=str(tmp_path), cache=False)
+    it = iter(result)
+    next(it)
+    next(it)
+    it.close()
+    del it
+    del result
+    gc.collect()
+    eq_([], os.listdir(str(tmp_path)))
+
+
+def test_mergesort_cache():
+
+    table1 = [['k', 'v'], [2, 'b'], [1, 'a']]
+    table2 = [['k', 'v'], [3, 'c']]
+
+    expectation = (('k', 'v'),
+                   (1, 'a'),
+                   (2, 'b'),
+                   (3, 'c'))
+
+    # by default results are cached and iteration is repeatable
+    actual = mergesort(table1, table2, key='k')
+    ieq(expectation, actual)
+    ieq(expectation, actual)
+
+    # cached results do not reflect later changes to the sources
+    table1.append([0, 'z'])
+    ieq(expectation, actual)
+
+    # with cache=False, later passes reflect changes to the sources
+    expectation_changed = (('k', 'v'),
+                           (0, 'z'),
+                           (1, 'a'),
+                           (2, 'b'),
+                           (3, 'c'))
+    actual = mergesort(table1, table2, key='k', cache=False)
+    ieq(expectation_changed, actual)
+    table2.append([-1, 'y'])
+    expectation_changed2 = (('k', 'v'),
+                            (-1, 'y'),
+                            (0, 'z'),
+                            (1, 'a'),
+                            (2, 'b'),
+                            (3, 'c'))
+    ieq(expectation_changed2, actual)
+
+
+def test_mergesort_presorted_streaming():
+    # presorted inputs are merged in a single streaming pass, without
+    # being reordered, re-scanned or fully materialised
+
+    consumed = list()
+
+    def generator(rows, tag):
+        yield ['k', 'v']
+        for row in rows:
+            consumed.append(tag)
+            yield row
+
+    gen1 = generator([[1, 'a'], [3, 'c']], 'gen1')
+    gen2 = generator([[2, 'b'], [4, 'd']], 'gen2')
+
+    result = mergesort(gen1, gen2, key='k', presorted=True)
+    it = iter(result)
+    eq_(('k', 'v'), next(it))
+    # only the headers have been read so far
+    eq_([], consumed)
+    eq_((1, 'a'), next(it))
+    # at most one row per input has been pulled beyond what was yielded
+    eq_(2, len(consumed))
+    eq_([(2, 'b'), (3, 'c'), (4, 'd')], list(it))
+
+    # one-shot inputs are consumed in a single pass
+    result = mergesort(generator([[1, 'a'], [3, 'c']], 'gen1'),
+                       generator([[2, 'b'], [4, 'd']], 'gen2'),
+                       key='k', presorted=True)
+    ieq((('k', 'v'), (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')), result)
+
+
+def test_mergesort_empty_and_short_rows():
+
+    # header-only tables
+    actual = mergesort([['a', 'b']], [['a', 'b'], [1, 2]])
+    ieq((('a', 'b'), (1, 2)), actual)
+    ieq((('a', 'b'), (1, 2)), actual)
+
+    # all tables header-only
+    actual = mergesort([['a', 'b']], [['a', 'b']])
+    ieq((('a', 'b'),), actual)
+
+    # completely empty tables (not even a header row)
+    actual = mergesort([], [['a', 'b'], [1, 2]])
+    ieq((('a', 'b'), (1, 2)), actual)
+    actual = mergesort([], [])
+    ieq([()], actual)
+
+    # short rows are filled with missing
+    table1 = [['a', 'b'], [1]]
+    table2 = [['a', 'b'], [2, 3]]
+    actual = mergesort(table1, table2)
+    ieq((('a', 'b'), (1, None), (2, 3)), actual)
+    ieq(sort(cat(table1, table2)), actual)
+
+
+def test_mergesort_equivalent_to_cat_then_sort():
+
+    table1 = (('foo', 'bar'),
+              ('A', 9),
+              ('C', 2),
+              ('D', 10),
+              ('A', 6),
+              ('F', 1))
+    table2 = (('foo', 'baz'),
+              ('B', 3),
+              ('D', 10),
+              ('A', 10),
+              ('F', 4))
+
+    for key in (None, 'foo', 'bar', ('foo', 'bar'), ('foo', 'baz'), 0, (0, 1)):
+        for reverse in (False, True):
+            expect = sort(cat(table1, table2), key=key, reverse=reverse)
+            # unsorted inputs, in memory and on disk
+            actual = mergesort(table1, table2, key=key, reverse=reverse)
+            ieq(expect, actual)
+            ieq(expect, actual)
+            actual = mergesort(table1, table2, key=key, reverse=reverse,
+                               buffersize=2)
+            ieq(expect, actual)
+            # presorted inputs (only keys present in both tables)
+            if key in (None, 'foo', 0):
+                actual = mergesort(sort(table1, key=key, reverse=reverse),
+                                   sort(table2, key=key, reverse=reverse),
+                                   key=key, reverse=reverse, presorted=True)
+                ieq(expect, actual)
+                ieq(expect, actual)
+
+
+def test_mergesort_bad_key():
+
+    table1 = (('foo', 'bar'),
+              ('A', 9))
+    table2 = (('foo', 'baz'),
+              ('B', 3))
+
+    with pytest.raises(FieldSelectionError):
+        for i in mergesort(table1, table2, key='quux'):
+            pass
+
+
 def test_issorted():
 
     table1 = (('foo', 'bar', 'baz'),

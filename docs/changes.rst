@@ -1,6 +1,25 @@
 Changes
 =======
 
+Unreleased
+----------
+
+* Fix: :func:`petl.transform.sorts.mergesort` raised ``TypeError`` under
+  Python 3 when merging tables with mixed value types and no explicit
+  ``key``. Comparisons now use the same rules as
+  :func:`petl.transform.sorts.sort` whether or not a ``key`` is given.
+
+* Fix: :func:`petl.transform.sorts.mergesort` could emit rows out of order
+  when input tables had different field orders, because each input was
+  sorted by its own field order. Input tables are now standardised to the
+  output header *before* sorting, so each input is sorted according to the
+  output fields.
+
+* Fix: :func:`petl.transform.sorts.mergesort` raised ``ValueError`` when an
+  explicit ``header`` excluded fields from an input table with short rows.
+  Short rows and missing fields are now filled with the value of
+  ``missing``, and long rows are trimmed to the output fields.
+
 Version 1.7.17
 --------------
 

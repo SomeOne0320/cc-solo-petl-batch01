@@ -299,8 +299,12 @@ class SortView(Table):
             indices = asindices(hdr, key)
         else:
             indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+        if len(indices) == 0:
+            # nothing to compare on, e.g., a table with no fields
+            getkey = None
+        else:
+            # now use field indices to construct a _getkey function
+            getkey = comparable_itemgetter(*indices)
 
         # TODO support native comparison
 
@@ -432,6 +436,30 @@ def mergesort(*tables, **kwargs):
     :func:`cat` then sorting, however this function will typically be more
     efficient, especially if the input tables are presorted.
 
+    The output header is determined in the same way as for :func:`cat`. If
+    no ``header`` is given, output fields are gathered from all of the
+    input tables in order of first appearance. Otherwise the given
+    ``header`` selects and orders the output fields, and fields not
+    included in it do not take part in comparisons. Before merging, each
+    input row is standardised to the output fields: missing fields and
+    short rows are filled with the value of ``missing``, and values
+    belonging to fields not present in the output header are discarded.
+
+    Comparisons use the same rules as :func:`sort`, so values of mixed
+    types (e.g., numbers and text, or values and ``None``) are ordered
+    consistently whether or not a ``key`` is given. The merge is stable:
+    rows with equal keys keep their original order within each input
+    table, and ties between input tables are broken by the order in which
+    the tables were given.
+
+    If ``presorted`` is ``False`` (the default), each input table is
+    standardised and then sorted individually, using the same external
+    sorting machinery as :func:`sort` (see the ``buffersize``, ``tempdir``
+    and ``cache`` arguments), and the sorted tables are then merged. If
+    ``presorted`` is ``True``, the input tables are assumed to already be
+    sorted according to the same output semantics and are merged directly,
+    in a single streaming pass over the inputs.
+
     Keyword arguments:
 
     key : string or tuple of strings, optional
@@ -443,13 +471,20 @@ def mergesort(*tables, **kwargs):
         `True` if inputs are already sorted by the given key (defaults to
         `False`)
     missing : object
-        Value to fill with when input tables have different fields (defaults to
-        `None`)
+        Value to fill with when input tables have different fields (defaults
+        to `None`)
     header : sequence of strings, optional
         Specify a fixed header for the output table
     buffersize : int, optional
-        Limit the number of rows in memory per input table when inputs are not
-        presorted
+        Limit the number of rows in memory per input table when inputs are
+        not presorted
+    tempdir : string, optional
+        Directory to use for temporary files when sorting inputs that do
+        not fit in the sort buffer (defaults to the system default)
+    cache : bool, optional
+        If `True` (the default) and inputs are not presorted, the results
+        of sorting each input table are cached, so that a second pass over
+        the merged table does not repeat the sort
 
     """
 
@@ -464,80 +499,133 @@ class MergeSortView(Table):
                  missing=None, header=None, buffersize=None, tempdir=None,
                  cache=True):
         self.key = key
+        self.reverse = reverse
+        self.presorted = presorted
+        self.missing = missing
+        self.header = header
         if presorted:
             self.tables = tables
         else:
-            self.tables = [sort(t, key=key, reverse=reverse,
-                                buffersize=buffersize, tempdir=tempdir,
-                                cache=cache)
-                           for t in tables]
-        self.missing = missing
-        self.header = header
-        self.reverse = reverse
+            self.sources = list(tables)
+            # N.B., each input table is standardised to the output fields
+            # *before* being sorted, so that each input is sorted according
+            # to the same output semantics. The sort views are created here
+            # and kept on self so that their caches persist across multiple
+            # iterations when cache=True; their sources are (re-)assigned
+            # on each pass in _itersortedmerge.
+            self.sortviews = [SortView(None, key=key, reverse=reverse,
+                                       buffersize=buffersize,
+                                       tempdir=tempdir, cache=cache)
+                              for _ in self.sources]
 
     def __iter__(self):
-        return itermergesort(self.tables, self.key, self.header, self.missing,
-                             self.reverse)
+        if self.presorted:
+            return itermergesort(self.tables, self.key, self.header,
+                                 self.missing, self.reverse)
+        else:
+            return self._itersortedmerge()
+
+    def _itersortedmerge(self):
+        # standardise all inputs to a common output header, sort each
+        # standardised input individually, then merge
+        state = _StandardiseState(self.sources, self.header, self.missing)
+        for i, sortview in enumerate(self.sortviews):
+            sortview.source = state.standardise_table(i)
+        for row in itermergesort(self.sortviews, self.key, self.header,
+                                 self.missing, self.reverse):
+            yield row
+
+
+def _standardiserows(rows, flds, ofs, missing):
+    # standardise the data rows of one input table to the output fields
+    # `ofs`, given the table's own fields `flds`; fill missing values with
+    # `missing` and discard values belonging to fields not in `ofs`
+    for row in rows:
+        try:
+            # should be quickest to do this way
+            yield tuple(row[flds.index(fo)] if fo in flds else missing
+                        for fo in ofs)
+        except IndexError:
+            # handle short rows
+            outrow = [missing] * len(ofs)
+            for i, fi in enumerate(flds):
+                if fi in ofs:
+                    try:
+                        outrow[ofs.index(fi)] = row[i]
+                    except IndexError:
+                        pass  # be relaxed about short rows
+            yield tuple(outrow)
+
+
+class _StandardiseState(object):
+    """Coordinate the standardisation of one or more input tables to a
+    common output header within a single iteration pass."""
+
+    def __init__(self, sources, header, missing):
+        self.sources = sources
+        self.missing = missing
+        # N.B., one header row is read from each input table in order to
+        # determine the output fields
+        self.iterators = [iter(t) for t in sources]
+        self.headers = list()
+        for it in self.iterators:
+            try:
+                self.headers.append(next(it))
+            except StopIteration:
+                self.headers.append([])
+        if header is None:
+            # determine output fields by gathering all fields found in the
+            # sources, in order of first appearance
+            outhdr = list()
+            for hdr in self.headers:
+                for f in list(map(text_type, hdr)):
+                    if f not in outhdr:
+                        # add any new fields as we find them
+                        outhdr.append(f)
+        else:
+            # predetermined output fields
+            outhdr = list(header)
+        self.outhdr = outhdr
+
+    def standardise_rows(self, i):
+        # iterate over the data rows of input table `i`, standardised to
+        # the output fields
+        flds = list(map(text_type, self.headers[i]))
+        return _standardiserows(self.iterators[i], flds, self.outhdr,
+                                self.missing)
+
+    def standardise_table(self, i):
+        # as standardise_rows(), but yield the output header row first, so
+        # the result can be used as a table in its own right
+        yield tuple(self.outhdr)
+        for row in self.standardise_rows(i):
+            yield row
 
 
 def itermergesort(sources, key, header, missing, reverse):
     # first need to standardise headers of all input tables
-    # borrow this from itercat - TODO remove code smells
-
-    its = [iter(t) for t in sources]
-    src_hdrs = []
-    for it in its:
-        try:
-            src_hdrs.append(next(it))
-        except StopIteration:
-            src_hdrs.append([])
-
-    if header is None:
-        # determine output fields by gathering all fields found in the sources
-        outhdr = list()
-        for hdr in src_hdrs:
-            for f in list(map(text_type, hdr)):
-                if f not in outhdr:
-                    # add any new fields as we find them
-                    outhdr.append(f)
-    else:
-        # predetermined output fields
-        outhdr = header
+    state = _StandardiseState(sources, header, missing)
+    outhdr = state.outhdr
     yield tuple(outhdr)
 
-    def _standardisedata(it, hdr, ofs):
-        flds = list(map(text_type, hdr))
-        # now construct and yield the data rows
-        for _row in it:
-            try:
-                # should be quickest to do this way
-                yield tuple(_row[flds.index(fo)] if fo in flds else missing
-                            for fo in ofs)
-            except IndexError:
-                # handle short rows
-                outrow = [missing] * len(ofs)
-                for i, fi in enumerate(flds):
-                    try:
-                        outrow[ofs.index(fi)] = _row[i]
-                    except IndexError:
-                        pass  # be relaxed about short rows
-                yield tuple(outrow)
-
     # wrap all iterators to standardise fields
-    sits = [_standardisedata(it, hdr, outhdr)
-            for hdr, it in zip(src_hdrs, its)]
+    sits = [state.standardise_rows(i) for i in range(len(sources))]
 
     # now determine key function
-    getkey = None
     if key is not None:
         # convert field selection into field indices
         indices = asindices(outhdr, key)
         # now use field indices to construct a _getkey function
-        # N.B., this will probably raise an exception on short rows
         getkey = comparable_itemgetter(*indices)
+    elif outhdr:
+        # N.B., compare complete output rows using Comparable, so that
+        # mixed types are ordered using the same rules as petl.sort
+        getkey = comparable_itemgetter(*range(len(outhdr)))
+    else:
+        getkey = None
 
     # OK, do the merge sort
-    for row in _shortlistmergesorted(getkey, reverse, *sits):
+    for row in _mergesorted(getkey, reverse, *sits):
         yield row
 
 
