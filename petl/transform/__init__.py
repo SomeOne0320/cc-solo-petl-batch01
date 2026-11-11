@@ -23,6 +23,8 @@ from petl.transform.selects import select, selectop, selectcontains, \
 from petl.transform.joins import join, leftjoin, rightjoin, outerjoin, \
     crossjoin, antijoin, lookupjoin, unjoin
 
+from petl.transform.asofjoins import asofjoin
+
 from petl.transform.hashjoins import hashjoin, hashleftjoin, hashrightjoin, \
     hashantijoin, hashlookupjoin
 

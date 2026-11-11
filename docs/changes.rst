@@ -1,6 +1,14 @@
 Changes
 =======
 
+Version 1.7.18
+--------------
+
+* Added :func:`petl.transform.asofjoins.asofjoin`, an as-of join that aligns
+  each left row with the nearest right row on or around a shared key value,
+  optionally within partitions, with backward, forward and nearest directions,
+  exact-match exclusion and inclusive tolerance support.
+
 Version 1.7.17
 --------------
 
