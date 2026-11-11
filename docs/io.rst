@@ -433,6 +433,10 @@ Databases
 .. autofunction:: petl.io.db.todb
 .. autofunction:: petl.io.db.appenddb
 
+The resource ownership, transaction and lifecycle rules shared by the read,
+write and DDL database paths are documented in
+:doc:`db_adapters`.
+
 .. module:: petl.io.remote
 .. _io_remotes:
 

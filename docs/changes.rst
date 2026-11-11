@@ -6,6 +6,15 @@ Version 1.7.17
 
 ## Whats Changed
 
+* refactor: unified the database read, DML (``todb``/``appenddb``) and DDL
+  (``create_table``/``drop_table``) paths behind a single resource adapter
+  layer (``petl.io.db_adapters``, ``petl.io.db_planning`` and
+  ``petl.io.db_runner``). Object resolution, resource ownership, transaction
+  scoping and cleanup are now shared across all three paths. This fixes
+  leaked SQLAlchemy Engine connections on reads/writes/DDL and unclosed
+  DB-API cursors on ``executemany`` errors. Public signatures and exports are
+  unchanged; see :doc:`db_adapters` for the ownership and lifecycle contract.
+
 * ci: added readthedocs settings file
   By :user:`juarezr`, :issue:`677`.
 

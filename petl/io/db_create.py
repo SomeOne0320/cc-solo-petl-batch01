@@ -7,6 +7,11 @@ or ``pip install SQLAlchemy``.
 Acknowledgments: much of the code of this module is based on the ``csvsql``
 utility in the `csvkit <https://github.com/onyxfish/csvkit>`_ package.
 
+The DDL execution path (``create_table``/``drop_table``) shares the object
+resolution, resource adapter and transaction/ownership machinery in
+:mod:`petl.io.db_adapters` and :mod:`petl.io.db_runner` with the read and DML
+paths in :mod:`petl.io.db`; this module only keeps the type inference and
+statement generation that is specific to CREATE TABLE.
 """
 
 
@@ -15,12 +20,11 @@ import logging
 from petl.compat import long, text_type
 
 
-from petl.errors import ArgumentError
 from petl.util.materialise import columns
 from petl.transform.basics import head
-from petl.io.db_utils import _is_dbapi_connection, _is_dbapi_cursor, \
-    _is_sqlalchemy_engine, _is_sqlalchemy_session, _is_sqlalchemy_connection,\
-    _quote
+from petl.io.db_adapters import DbTarget, resolve_target
+from petl.io.db_planning import build_drop_statement
+from petl.io.db_runner import run_ddl
 
 
 logger = logging.getLogger(__name__)
@@ -190,6 +194,17 @@ def make_create_table_statement(table, tablename, schema=None,
                      .compile(dialect=sql_dialect)).strip()
 
 
+def _as_target(dbo):
+    """Accept either a raw database object or an already resolved target."""
+    if isinstance(dbo, DbTarget):
+        return dbo
+    # Internal carrier produced by petl.io.db for todb(create=...).
+    wrapped = getattr(dbo, 'target', None)
+    if isinstance(wrapped, DbTarget):
+        return wrapped
+    return resolve_target(dbo)
+
+
 def create_table(table, dbo, tablename, schema=None, commit=True,
                  constraints=True, metadata=None, dialect=None, sample=1000):
     """
@@ -219,6 +234,11 @@ def create_table(table, dbo, tablename, schema=None, commit=True,
         Number of rows to sample when inferring types etc., set to 0 to use
         the whole table
 
+    Execution goes through the shared adapter layer: cursors petl creates are
+    closed on success and failure, SQLAlchemy connections checked out from an
+    Engine are returned, and the transaction follows the same ownership rules
+    as :func:`petl.io.db.todb`.
+
     """
 
     if sample > 0:
@@ -226,7 +246,8 @@ def create_table(table, dbo, tablename, schema=None, commit=True,
     sql = make_create_table_statement(table, tablename, schema=schema,
                                       constraints=constraints,
                                       metadata=metadata, dialect=dialect)
-    _execute(sql, dbo, commit=commit)
+    target = _as_target(dbo)
+    _execute(sql, target, commit=commit)
 
 
 def drop_table(dbo, tablename, schema=None, commit=True):
@@ -247,134 +268,17 @@ def drop_table(dbo, tablename, schema=None, commit=True):
 
     """
 
-    # sanitise table name
-    tablename = _quote(tablename)
-    if schema is not None:
-        tablename = _quote(schema) + '.' + tablename
-
-    sql = u'DROP TABLE %s' % tablename
-    _execute(sql, dbo, commit)
+    target = _as_target(dbo)
+    sql = build_drop_statement(tablename, schema)
+    _execute(sql, target, commit)
 
 
-def _execute(sql, dbo, commit):
+def _execute(sql, target, commit):
+    """Single DDL execution entry point shared by create and drop.
 
+    ``target`` is always a resolved :class:`~petl.io.db_adapters.DbTarget` by
+    the time it reaches here; the polymorphic object dispatch lives in
+    :func:`petl.io.db_adapters.resolve_target`.
+    """
     debug(sql)
-
-    # need to deal with polymorphic dbo argument
-    # what sort of duck is it?
-
-    # does it quack like a standard DB-API 2.0 connection?
-    if _is_dbapi_connection(dbo):
-        debug('assuming %r is standard DB-API 2.0 connection', dbo)
-        _execute_dbapi_connection(sql, dbo, commit)
-
-    # does it quack like a standard DB-API 2.0 cursor?
-    elif _is_dbapi_cursor(dbo):
-        debug('assuming %r is standard DB-API 2.0 cursor')
-        _execute_dbapi_cursor(sql, dbo, commit)
-
-    # does it quack like an SQLAlchemy engine?
-    elif _is_sqlalchemy_engine(dbo):
-        debug('assuming %r is an instance of sqlalchemy.engine.base.Engine',
-              dbo)
-        _execute_sqlalchemy_engine(sql, dbo, commit)
-
-    # does it quack like an SQLAlchemy session?
-    elif _is_sqlalchemy_session(dbo):
-        debug('assuming %r is an instance of sqlalchemy.orm.session.Session',
-              dbo)
-        _execute_sqlalchemy_session(sql, dbo, commit)
-
-    # does it quack like an SQLAlchemy connection?
-    elif _is_sqlalchemy_connection(dbo):
-        debug('assuming %r is an instance of '
-              'sqlalchemy.engine.base.Connection',
-              dbo)
-        _execute_sqlalchemy_connection(sql, dbo, commit)
-
-    elif callable(dbo):
-        debug('assuming %r is a function returning standard DB-API 2.0 cursor '
-              'objects', dbo)
-        _execute_dbapi_mkcurs(sql, dbo, commit)
-
-    # some other sort of duck...
-    else:
-        raise ArgumentError('unsupported database object type: %r' % dbo)
-
-
-def _execute_dbapi_connection(sql, connection, commit):
-
-    debug('obtain a cursor')
-    cursor = connection.cursor()
-
-    debug('execute SQL')
-    cursor.execute(sql)
-
-    debug('close the cursor')
-    cursor.close()
-
-    if commit:
-        debug('commit transaction')
-        connection.commit()
-
-
-def _execute_dbapi_mkcurs(sql, mkcurs, commit):
-
-    debug('obtain a cursor')
-    cursor = mkcurs()
-
-    debug('execute SQL')
-    cursor.execute(sql)
-
-    debug('close the cursor')
-    cursor.close()
-
-    if commit:
-        debug('commit transaction')
-        # N.B., we depend on this optional DB-API 2.0 attribute being
-        # implemented
-        assert hasattr(cursor, 'connection'), \
-            'could not obtain connection via cursor'
-        connection = cursor.connection
-        connection.commit()
-
-
-def _execute_dbapi_cursor(sql, cursor, commit):
-
-    debug('execute SQL')
-    cursor.execute(sql)
-
-    # don't close the cursor, leave that to the application
-
-    if commit:
-        debug('commit transaction')
-        # N.B., we depend on this optional DB-API 2.0 attribute being
-        # implemented
-        assert hasattr(cursor, 'connection'),\
-            'could not obtain connection via cursor'
-        connection = cursor.connection
-        connection.commit()
-
-
-def _execute_sqlalchemy_connection(sql, connection, commit):
-
-    if commit:
-        debug('begin transaction')
-        trans = connection.begin()
-
-    debug('execute SQL')
-    connection.execute(sql)
-
-    if commit:
-        debug('commit transaction')
-        trans.commit()
-
-    # N.B., don't close connection, leave that to the application
-
-
-def _execute_sqlalchemy_engine(sql, engine, commit):
-    _execute_sqlalchemy_connection(sql, engine.connect(), commit)
-
-
-def _execute_sqlalchemy_session(sql, session, commit):
-    _execute_sqlalchemy_connection(sql, session.connection(), commit)
+    run_ddl(target, sql, commit)

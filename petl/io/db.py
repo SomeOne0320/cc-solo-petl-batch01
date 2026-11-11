@@ -4,16 +4,16 @@ from __future__ import absolute_import, print_function, division
 
 # standard library dependencies
 import logging
-from petl.compat import next, text_type, string_types
+from petl.compat import string_types
 
 
 # internal dependencies
-from petl.errors import ArgumentError
 from petl.util.base import Table
-from petl.io.db_utils import _is_dbapi_connection, _is_dbapi_cursor, \
-    _is_sqlalchemy_connection, _is_sqlalchemy_engine, _is_sqlalchemy_session, \
-    _is_clikchouse_dbapi_connection, _quote, _placeholders
+from petl.io.db_adapters import resolve_target, open_sqlite_file_target, \
+    ResourceStack, make_adapter, CleanupError, KIND_DBAPI, \
+    SOURCE_SQLITE_FILE
 from petl.io.db_create import drop_table, create_table
+from petl.io.db_runner import run_dml
 
 
 logger = logging.getLogger(__name__)
@@ -56,8 +56,8 @@ def fromdb(dbo, query, *args, **kwargs):
     The parameter `dbo` may also be an SQLAlchemy engine, session or
     connection object.
 
-    The parameter `dbo` may also be a string, in which case it is interpreted as
-    the name of a file containing an :mod:`sqlite3` database.
+    The parameter `dbo` may also be a string, in which case it is interpreted
+    as the name of a file containing an :mod:`sqlite3` database.
 
     Note that the default behaviour of most database servers and clients is for
     the entire result set for each query to be sent from the server to the
@@ -79,131 +79,102 @@ def fromdb(dbo, query, *args, **kwargs):
         * http://initd.org/psycopg/docs/usage.html#server-side-cursors
         * http://mysql-python.sourceforge.net/MySQLdb.html#using-and-extending
 
+    **Resource ownership**
+
+    Constructing the view and calling :func:`iter` on it never connects,
+    opens a cursor or executes SQL; resources are only acquired on the first
+    row pull. Each iteration acquires its own resources:
+
+    * a DB-API connection or cursor factory: petl closes the cursors it
+      creates but never the caller's connection;
+    * a directly borrowed DB-API cursor: petl neither closes nor replaces it,
+      and two iterations cannot interleave safely because they share the
+      single caller-managed cursor;
+    * an sqlite file name: each iteration opens and closes its own
+      connection, so iterations are independent;
+    * an SQLAlchemy Engine: each iteration checks out and returns its own
+      Connection (the engine is never disposed);
+    * a borrowed SQLAlchemy Connection/Session: petl never closes or commits
+      it; the query ``Result`` petl creates is always closed first.
+
+    Reads never manage transactions. The same rules apply on normal
+    exhaustion, explicit ``iterator.close()`` and any execute/fetch error.
+
     """
 
     # convenience for working with sqlite3
     if isinstance(dbo, string_types):
-        import sqlite3
-        dbo = sqlite3.connect(dbo)
+        return DbView(None, query, args, kwargs, sqlite_file=dbo)
 
-    return DbView(dbo, query, *args, **kwargs)
+    return DbView(dbo, query, args, kwargs)
 
 
 class DbView(Table):
 
-    def __init__(self, dbo, query, *args, **kwargs):
+    def __init__(self, dbo, query, args, kwargs, sqlite_file=None):
         self.dbo = dbo
         self.query = query
-        self.args = args
         self.kwargs = kwargs
+        # store args as a tuple so repeated iterations forward them verbatim
+        self.args = tuple(args)
+        self.sqlite_file = sqlite_file
 
     def __iter__(self):
-
-        # does it quack like a standard DB-API 2.0 connection?
-        if _is_dbapi_connection(self.dbo):
-            debug('assuming %r is standard DB-API 2.0 connection', self.dbo)
-            _iter = _iter_dbapi_connection
-
-        # does it quack like a standard DB-API 2.0 cursor?
-        elif _is_dbapi_cursor(self.dbo):
-            debug('assuming %r is standard DB-API 2.0 cursor')
-            warning('using a DB-API cursor with fromdb() is not recommended '
-                    'and may lead to unexpected results, a DB-API connection '
-                    'is better')
-            _iter = _iter_dbapi_cursor
-
-        # does it quack like an SQLAlchemy engine?
-        elif _is_sqlalchemy_engine(self.dbo):
-            debug('assuming %r instance of sqlalchemy.engine.base.Engine',
-                  self.dbo)
-            _iter = _iter_sqlalchemy_engine
-
-        # does it quack like an SQLAlchemy session?
-        elif _is_sqlalchemy_session(self.dbo):
-            debug('assuming %r instance of sqlalchemy.orm.session.Session',
-                  self.dbo)
-            _iter = _iter_sqlalchemy_session
-
-        # does it quack like an SQLAlchemy connection?
-        elif _is_sqlalchemy_connection(self.dbo):
-            debug('assuming %r instance of sqlalchemy.engine.base.Connection',
-                  self.dbo)
-            _iter = _iter_sqlalchemy_connection
-
-        elif callable(self.dbo):
-            debug('assuming %r is a function returning a cursor', self.dbo)
-            _iter = _iter_dbapi_mkcurs
-
-        # some other sort of duck...
+        # Resolution happens per iteration (not at construction) so merely
+        # building the view never touches the database.
+        if self.sqlite_file is not None:
+            target = open_sqlite_file_target(self.sqlite_file)
         else:
-            raise ArgumentError('unsupported database object type: %r' % self.dbo)
+            target = resolve_target(self.dbo)
+        return _iter_target(target, self.query, self.args, self.kwargs)
 
-        return _iter(self.dbo, self.query, *self.args, **self.kwargs)
 
+def _iter_target(target, query, args, kwargs):
+    """Single streaming read implementation shared by every object type.
 
-def _iter_dbapi_mkcurs(mkcurs, query, *args, **kwargs):
-    cursor = mkcurs()
+    Generator semantics give us the lazy contract for free: nothing before
+    the first ``yield`` runs until the caller pulls the first row, and the
+    ``finally`` block runs identically on exhaustion, ``close()`` and raised
+    exceptions.
+    """
+    resources = ResourceStack()
+    # For an sqlite file the connection itself is petl-owned and must be
+    # closed after (and only after) its cursors/results.
+    if target.source == SOURCE_SQLITE_FILE:
+        resources.register('sqlite file connection', target.obj,
+                           _close_dbapi_connection)
+    adapter = make_adapter(target, resources)
+    error = None
     try:
-        for row in _iter_dbapi_cursor(cursor, query, *args, **kwargs):
-            yield row
+        result = adapter.open_query(query, args, dict(kwargs))
+        if target.kind == KIND_DBAPI:
+            header, first_row, row_iter = result.header()
+            yield tuple(header)
+            if first_row is not None:
+                yield first_row  # native driver row, no tuple/dict coercion
+            for row in row_iter:
+                yield row
+        else:
+            header, _ignored, row_iter = result.header()
+            yield tuple(header)
+            for row in row_iter:
+                yield row
+    except GeneratorExit:
+        # Triggered by explicit iterator.close() while suspended.
+        raise
+    except Exception as exc:
+        error = exc
+        raise
     finally:
-        cursor.close()
+        cleanup_error = resources.release_all(prior_error=error)
+        if error is None and isinstance(cleanup_error, CleanupError):
+            # Only a cleanup failure occurred: surface it rather than ending
+            # the iteration silently.
+            raise cleanup_error
 
 
-def _iter_dbapi_connection(connection, query, *args, **kwargs):
-    cursor = connection.cursor()
-    try:
-        for row in _iter_dbapi_cursor(cursor, query, *args, **kwargs):
-            yield row
-    finally:
-        cursor.close()
-
-
-def _iter_dbapi_cursor(cursor, query, *args, **kwargs):
-    cursor.execute(query, *args, **kwargs)
-    # fetch one row before iterating, to force population of cursor.description
-    # which may be postponed if using server-side cursors
-    # not all database drivers populate cursor after execute so we call fetchall
-    try:
-        it = iter(cursor)
-    except TypeError:
-        it = iter(cursor.fetchall())
-    try:
-        first_row = next(it)
-    except StopIteration:
-        first_row = None
-    # fields should be available now
-    hdr = [d[0] for d in cursor.description]
-    yield tuple(hdr)
-    if first_row is None:
-        return
-    yield first_row
-    for row in it:
-        yield row  # don't wrap, return whatever the database engine returns
-
-
-def _iter_sqlalchemy_engine(engine, query, *args, **kwargs):
-    connection = engine.connect()
-    for row in _iter_sqlalchemy_connection(connection, query, *args, **kwargs):
-        yield row
+def _close_dbapi_connection(connection):
     connection.close()
-
-
-def _iter_sqlalchemy_connection(connection, query, *args, **kwargs):
-    debug('connection: %r', connection)
-    results = connection.execute(query, *args, **kwargs)
-    hdr = results.keys()
-    yield tuple(hdr)
-    for row in results:
-        yield row
-
-
-def _iter_sqlalchemy_session(session, query, *args, **kwargs):
-    results = session.execute(query, *args, **kwargs)
-    hdr = results.keys()
-    yield tuple(hdr)
-    for row in results:
-        yield row
 
 
 def todb(table, dbo, tablename, schema=None, commit=True,
@@ -231,7 +202,6 @@ def todb(table, dbo, tablename, schema=None, commit=True,
         >>> # assuming table "foobar" already exists in the database
         ... etl.todb(table, connection, 'foobar')
         >>> # using pymysql
-        >>> import pymysql
         >>> connection = pymysql.connect(password='moonpie', database='thangs')
         >>> # tell MySQL to use standard quote character
         ... connection.cursor().execute('SET SQL_MODE=ANSI_QUOTES')
@@ -290,6 +260,23 @@ def todb(table, dbo, tablename, schema=None, commit=True,
         Number of rows to sample when inferring types etc. Set to 0 to use the
         whole table (only relevant if create=True)
 
+    **Resource and transaction ownership**
+
+    Every supported object type goes through the shared database adapter
+    layer (see :mod:`petl.io.db_adapters`). Borrowed DB-API connections,
+    cursors and cursor factories are never closed by petl; cursors petl
+    creates are always closed, including after an execution or source-row
+    error. With ``commit=True`` a successful load is committed exactly once;
+    on failure petl does not commit and does not roll back a borrowed
+    connection's transaction - the caller keeps control. sqlite file names
+    open a petl-owned connection that is always closed, with a rollback on
+    failure when ``commit=True``. SQLAlchemy Engines only return the
+    connections petl checked out (never ``dispose``); borrowed Connections and
+    Sessions keep their outer transactions, with petl using a SAVEPOINT scope
+    when an outer transaction already exists. The DDL steps triggered by
+    ``create``/``drop`` follow the same per-step contract; the steps are not
+    wrapped in one cross-statement atomic transaction.
+
     .. note::
 
         This function is in principle compatible with any DB-API 2.0
@@ -324,340 +311,23 @@ def todb(table, dbo, tablename, schema=None, commit=True,
 
     """
 
-    needs_closing = False
-
-    # convenience for working with sqlite3
-    if isinstance(dbo, string_types):
-        import sqlite3
-        dbo = sqlite3.connect(dbo)
-        needs_closing = True
-
+    target = _resolve_write_target(dbo)
     try:
         if create:
             if drop:
-                drop_table(dbo, tablename, schema=schema, commit=commit)
-            create_table(table, dbo, tablename, schema=schema, commit=commit,
+                drop_table(_TargetWrapper(target), tablename, schema=schema,
+                           commit=commit)
+            create_table(table, _TargetWrapper(target), tablename,
+                         schema=schema, commit=commit,
                          constraints=constraints, metadata=metadata,
                          dialect=dialect, sample=sample)
-        _todb(table, dbo, tablename, schema=schema, commit=commit,
-              truncate=True)
-
+        run_dml(target, table, tablename, schema=schema, commit=commit,
+                truncate=True)
     finally:
-        if needs_closing:
-            dbo.close()
+        _release_write_target(dbo, target)
 
 
 Table.todb = todb
-
-
-def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False):
-
-    # need to deal with polymorphic dbo argument
-    # what sort of duck is it?
-
-    if _is_clikchouse_dbapi_connection(dbo):
-        debug('assuming %r is clickhosue DB-API 2.0 connection', dbo)
-        _todb_clikchouse_dbapi_connection(table, dbo, tablename, schema=schema,
-                               commit=commit, truncate=truncate)
-
-    # does it quack like a standard DB-API 2.0 connection?
-    elif _is_dbapi_connection(dbo):
-        debug('assuming %r is standard DB-API 2.0 connection', dbo)
-        _todb_dbapi_connection(table, dbo, tablename, schema=schema,
-                               commit=commit, truncate=truncate)
-
-    # does it quack like a standard DB-API 2.0 cursor?
-    elif _is_dbapi_cursor(dbo):
-        debug('assuming %r is standard DB-API 2.0 cursor')
-        _todb_dbapi_cursor(table, dbo, tablename, schema=schema, commit=commit,
-                           truncate=truncate)
-
-    # does it quack like an SQLAlchemy engine?
-    elif _is_sqlalchemy_engine(dbo):
-        debug('assuming %r instance of sqlalchemy.engine.base.Engine', dbo)
-        _todb_sqlalchemy_engine(table, dbo, tablename, schema=schema,
-                                commit=commit, truncate=truncate)
-
-    # does it quack like an SQLAlchemy session?
-    elif _is_sqlalchemy_session(dbo):
-        debug('assuming %r instance of sqlalchemy.orm.session.Session', dbo)
-        _todb_sqlalchemy_session(table, dbo, tablename, schema=schema,
-                                 commit=commit, truncate=truncate)
-
-    # does it quack like an SQLAlchemy connection?
-    elif _is_sqlalchemy_connection(dbo):
-        debug('assuming %r instance of sqlalchemy.engine.base.Connection', dbo)
-        _todb_sqlalchemy_connection(table, dbo, tablename, schema=schema,
-                                    commit=commit, truncate=truncate)
-
-    elif callable(dbo):
-        debug('assuming %r is a function returning standard DB-API 2.0 cursor '
-              'objects', dbo)
-        _todb_dbapi_mkcurs(table, dbo, tablename, schema=schema, commit=commit,
-                           truncate=truncate)
-
-    # some other sort of duck...
-    else:
-        raise ArgumentError('unsupported database object type: %r' % dbo)
-
-
-SQL_TRUNCATE_QUERY = 'DELETE FROM %s'
-SQL_INSERT_QUERY = 'INSERT INTO %s (%s) VALUES (%s)'
-
-
-def _todb_dbapi_connection(table, connection, tablename, schema=None,
-                           commit=True, truncate=False):
-
-    # sanitise table name
-    tablename = _quote(tablename)
-    if schema is not None:
-        tablename = _quote(schema) + '.' + tablename
-    debug('tablename: %r', tablename)
-
-    # sanitise field names
-    it = iter(table)
-    hdr = next(it)
-    flds = list(map(text_type, hdr))
-    colnames = [_quote(n) for n in flds]
-    debug('column names: %r', colnames)
-
-    # determine paramstyle and build placeholders string
-    placeholders = _placeholders(connection, colnames)
-    debug('placeholders: %r', placeholders)
-
-    # get a cursor
-    cursor = connection.cursor()
-
-    if truncate:
-        # TRUNCATE is not supported in some databases and causing locks with
-        # MySQL used via SQLAlchemy, fall back to DELETE FROM for now
-        truncatequery = SQL_TRUNCATE_QUERY % tablename
-        debug('truncate the table via query %r', truncatequery)
-        cursor.execute(truncatequery)
-        # just in case, close and resurrect cursor
-        cursor.close()
-        cursor = connection.cursor()
-
-    insertcolnames = ', '.join(colnames)
-    insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
-    debug('insert data via query %r' % insertquery)
-    cursor.executemany(insertquery, it)
-
-    # finish up
-    debug('close the cursor')
-    cursor.close()
-
-    if commit:
-        debug('commit transaction')
-        connection.commit()
-
-
-def _todb_clikchouse_dbapi_connection(table, connection, tablename, schema=None,
-                           commit=True, truncate=False):
-
-    # sanitise table name
-    tablename = _quote(tablename)
-    if schema is not None:
-        tablename = _quote(schema) + '.' + tablename
-    debug('tablename: %r', tablename)
-
-    # sanitise field names
-    it = iter(table)
-    hdr = next(it)
-    flds = list(map(text_type, hdr))
-    colnames = [_quote(n) for n in flds]
-    debug('column names: %r', colnames)
-
-    # determine paramstyle and build placeholders string
-    placeholders = _placeholders(connection, colnames)
-    debug('placeholders: %r', placeholders)
-
-    # get a cursor
-    cursor = connection.cursor()
-
-    if truncate:
-        # TRUNCATE is not supported in some databases and causing locks with
-        # MySQL used via SQLAlchemy, fall back to DELETE FROM for now
-        truncatequery = 'TRUNCATE TABLE IF EXISTS %s' % tablename
-        debug('truncate the table via query %r', truncatequery)
-        cursor.execute(truncatequery)
-        # just in case, close and resurrect cursor
-        cursor.close()
-        cursor = connection.cursor()
-
-    insertcolnames = ', '.join(colnames)
-    insertquery = 'INSERT INTO %s (%s) VALUES' % (tablename, insertcolnames)
-    debug('insert data via query %r' % insertquery)
-    cursor.executemany(insertquery, it)
-
-    # finish up
-    debug('close the cursor')
-    cursor.close()
-
-    if commit:
-        debug('commit transaction')
-        connection.commit()
-
-
-def _todb_dbapi_mkcurs(table, mkcurs, tablename, schema=None, commit=True,
-                       truncate=False):
-
-    # sanitise table name
-    tablename = _quote(tablename)
-    if schema is not None:
-        tablename = _quote(schema) + '.' + tablename
-    debug('tablename: %r', tablename)
-
-    # sanitise field names
-    it = iter(table)
-    hdr = next(it)
-    flds = list(map(text_type, hdr))
-    colnames = [_quote(n) for n in flds]
-    debug('column names: %r', colnames)
-
-    debug('obtain cursor and connection')
-    cursor = mkcurs()
-    # N.B., we depend on this optional DB-API 2.0 attribute being implemented
-    assert hasattr(cursor, 'connection'), \
-        'could not obtain connection via cursor'
-    connection = cursor.connection
-
-    # determine paramstyle and build placeholders string
-    placeholders = _placeholders(connection, colnames)
-    debug('placeholders: %r', placeholders)
-
-    if truncate:
-        # TRUNCATE is not supported in some databases and causing locks with
-        # MySQL used via SQLAlchemy, fall back to DELETE FROM for now
-        truncatequery = SQL_TRUNCATE_QUERY % tablename
-        debug('truncate the table via query %r', truncatequery)
-        cursor.execute(truncatequery)
-        # N.B., may be server-side cursor, need to resurrect
-        cursor.close()
-        cursor = mkcurs()
-
-    insertcolnames = ', '.join(colnames)
-    insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
-    debug('insert data via query %r' % insertquery)
-    cursor.executemany(insertquery, it)
-    cursor.close()
-
-    if commit:
-        debug('commit transaction')
-        connection.commit()
-
-
-def _todb_dbapi_cursor(table, cursor, tablename, schema=None, commit=True,
-                       truncate=False):
-
-    # sanitise table name
-    tablename = _quote(tablename)
-    if schema is not None:
-        tablename = _quote(schema) + '.' + tablename
-    debug('tablename: %r', tablename)
-
-    # sanitise field names
-    it = iter(table)
-    hdr = next(it)
-    flds = list(map(text_type, hdr))
-    colnames = [_quote(n) for n in flds]
-    debug('column names: %r', colnames)
-
-    debug('obtain connection via cursor')
-    # N.B., we depend on this optional DB-API 2.0 attribute being implemented
-    assert hasattr(cursor, 'connection'), \
-        'could not obtain connection via cursor'
-    connection = cursor.connection
-
-    # determine paramstyle and build placeholders string
-    placeholders = _placeholders(connection, colnames)
-    debug('placeholders: %r', placeholders)
-
-    if truncate:
-        # TRUNCATE is not supported in some databases and causing locks with
-        # MySQL used via SQLAlchemy, fall back to DELETE FROM for now
-        truncatequery = SQL_TRUNCATE_QUERY % tablename
-        debug('truncate the table via query %r', truncatequery)
-        cursor.execute(truncatequery)
-
-    insertcolnames = ', '.join(colnames)
-    insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
-    debug('insert data via query %r' % insertquery)
-    cursor.executemany(insertquery, it)
-
-    # N.B., don't close the cursor, leave that to the application
-
-    if commit:
-        debug('commit transaction')
-        connection.commit()
-
-
-def _todb_sqlalchemy_engine(table, engine, tablename, schema=None, commit=True,
-                            truncate=False):
-
-    _todb_sqlalchemy_connection(table, engine.connect(), tablename,
-                                schema=schema, commit=commit, truncate=truncate)
-
-
-def _todb_sqlalchemy_connection(table, connection, tablename, schema=None,
-                                commit=True, truncate=False):
-
-    debug('connection: %r', connection)
-
-    # sanitise table name
-    tablename = _quote(tablename)
-    if schema is not None:
-        tablename = _quote(schema) + '.' + tablename
-    debug('tablename: %r', tablename)
-
-    # sanitise field names
-    it = iter(table)
-    hdr = next(it)
-    flds = list(map(text_type, hdr))
-    colnames = [_quote(n) for n in flds]
-    debug('column names: %r', colnames)
-
-    # N.B., we need to obtain a reference to the underlying DB-API connection so
-    # we can import the module and determine the paramstyle
-    proxied_raw_connection = connection.connection
-    actual_raw_connection = proxied_raw_connection.connection
-
-    # determine paramstyle and build placeholders string
-    placeholders = _placeholders(actual_raw_connection, colnames)
-    debug('placeholders: %r', placeholders)
-
-    if commit:
-        debug('begin transaction')
-        trans = connection.begin()
-
-    if truncate:
-        # TRUNCATE is not supported in some databases and causing locks with
-        # MySQL used via SQLAlchemy, fall back to DELETE FROM for now
-        truncatequery = SQL_TRUNCATE_QUERY % tablename
-        debug('truncate the table via query %r', truncatequery)
-        connection.execute(truncatequery)
-
-    insertcolnames = ', '.join(colnames)
-    insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
-    debug('insert data via query %r' % insertquery)
-    for row in it:
-        connection.execute(insertquery, row)
-
-    # finish up
-
-    if commit:
-        debug('commit transaction')
-        trans.commit()
-
-    # N.B., don't close connection, leave that to the application
-
-
-def _todb_sqlalchemy_session(table, session, tablename, schema=None,
-                             commit=True, truncate=False):
-
-    _todb_sqlalchemy_connection(table, session.connection(), tablename,
-                                schema=schema, commit=commit,
-                                truncate=truncate)
 
 
 def appenddb(table, dbo, tablename, schema=None, commit=True):
@@ -669,21 +339,62 @@ def appenddb(table, dbo, tablename, schema=None, commit=True):
 
     """
 
-    needs_closing = False
-
-    # convenience for working with sqlite3
-    if isinstance(dbo, string_types):
-        import sqlite3
-        dbo = sqlite3.connect(dbo)
-        needs_closing = True
-
+    target = _resolve_write_target(dbo)
     try:
-        _todb(table, dbo, tablename, schema=schema, commit=commit,
-              truncate=False)
-
+        run_dml(target, table, tablename, schema=schema, commit=commit,
+                truncate=False)
     finally:
-        if needs_closing:
-            dbo.close()
+        _release_write_target(dbo, target)
 
 
 Table.appenddb = appenddb
+
+
+def _resolve_write_target(dbo):
+    """Resolve a write/DDL dbo, opening sqlite file connections as owned."""
+    if isinstance(dbo, string_types):
+        return open_sqlite_file_target(dbo)
+    if isinstance(dbo, _TargetWrapper):
+        return dbo.target
+    return resolve_target(dbo)
+
+
+def _release_write_target(dbo, target):
+    """Close petl-owned sqlite file connections; nothing else."""
+    if isinstance(dbo, string_types) and target.source == SOURCE_SQLITE_FILE:
+        target.obj.close()
+
+
+class _TargetWrapper(object):
+    """Internal carrier so todb can pass a resolved target into DDL helpers.
+
+    The public create_table/drop_table signatures keep accepting raw dbo
+    objects; internally a todb(create=True/...) call hands them the already
+    resolved target to avoid re-resolving (and re-opening sqlite files) per
+    step.
+    """
+
+    def __init__(self, target):
+        self.target = target
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible private helpers and constants
+# ---------------------------------------------------------------------------
+# These SQL strings used to live in this module; the canonical definitions
+# now belong to the shared planning module. Re-export them so any code that
+# imported them from petl.io.db keeps working.
+from petl.io import db_planning as _db_planning
+
+SQL_TRUNCATE_QUERY = _db_planning.SQL_TRUNCATE_QUERY
+SQL_INSERT_QUERY = _db_planning.SQL_INSERT_QUERY
+
+
+def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False):
+    """Legacy internal entry point retained for compatibility."""
+    target = _resolve_write_target(dbo)
+    try:
+        run_dml(target, table, tablename, schema=schema, commit=commit,
+                truncate=truncate)
+    finally:
+        _release_write_target(dbo, target)
