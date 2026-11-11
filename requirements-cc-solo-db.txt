@@ -1,0 +1,3 @@
+-r requirements-cc-solo.txt
+SQLAlchemy==1.4.54
+greenlet==3.2.4
